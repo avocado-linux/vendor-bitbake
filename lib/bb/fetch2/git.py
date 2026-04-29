@@ -550,12 +550,32 @@ class Git(FetchMethod):
                         % (tfile, mtime), d, workdir=ud.clonedir)
             runfetchcmd("touch %s.done" % ud.fullmirror, d)
 
+    def _copy_clonedir_lfs(self, ud, d, dest_git_dir):
+        """
+        Copy LFS object storage from the bare clonedir into a destination
+        .git directory. The smudge filter at checkout time only resolves
+        LFS pointers from `<dest>/.git/lfs/objects`; a plain `git clone`
+        from a local bare repository (even with --shared) does not
+        propagate the bare repo's lfs/ tree, so without this copy the
+        smudge filter would phone home — which fails when do_unpack runs
+        in a network-isolated namespace.
+        """
+        src_lfs = os.path.join(ud.clonedir, "lfs")
+        if not os.path.exists(src_lfs):
+            return
+        bb.utils.mkdirhier(dest_git_dir)
+        runfetchcmd("tar -cf - lfs | tar -xf - -C %s" % shlex.quote(dest_git_dir),
+                    d, workdir=ud.clonedir)
+
     def clone_shallow_local(self, ud, dest, d):
         """Clone the repo and make it shallow.
 
         The upstream url of the new clone isn't set at this time, as it'll be
         set correctly when unpacked."""
         runfetchcmd("%s clone %s %s %s" % (ud.basecmd, ud.cloneflags, ud.clonedir, dest), d)
+        # Propagate any LFS objects pre-staged in the bare clonedir into the
+        # shallow clone so the resulting shallow tarball is self-contained.
+        self._copy_clonedir_lfs(ud, d, os.path.join(dest, ".git"))
 
         to_parse, shallow_branches = [], []
         for name in ud.names:
@@ -674,6 +694,12 @@ class Git(FetchMethod):
                 bb.note("Repository %s has LFS content but it is not being fetched" % (repourl))
             else:
                 runfetchcmd("%s lfs install --local" % ud.basecmd, d, workdir=destdir)
+                # When the working tree was sourced from the bare clonedir,
+                # `git clone -s` does not propagate the bare repo's lfs/
+                # store. Copy it now so the upcoming checkout's smudge
+                # filter resolves LFS pointers locally instead of phoning
+                # home (do_unpack runs without network access).
+                self._copy_clonedir_lfs(ud, d, os.path.join(destdir, ".git"))
 
         if not ud.nocheckout:
             if subpath:
@@ -759,7 +785,17 @@ class Git(FetchMethod):
 
     def _contains_lfs(self, ud, d, wd):
         """
-        Check if the repository has 'lfs' (large file) content
+        Check if the repository has 'lfs' (large file) content.
+
+        Walks every .gitattributes file in the tree at the requested ref,
+        not only the top-level one. Some repositories (e.g. ones that ship
+        prebuilts under third_party/) place `filter=lfs` rules in
+        subdirectory .gitattributes files, which the prior top-level-only
+        grep would miss. That false negative caused LFS pre-staging to be
+        silently skipped during do_fetch, after which do_unpack's
+        `git checkout` would still trigger the smudge filter (since git
+        itself reads .gitattributes recursively) and fail with ENETUNREACH
+        in the network-isolated do_unpack task.
         """
 
         if ud.nobranch:
@@ -771,15 +807,24 @@ class Git(FetchMethod):
         else:
             refname = "origin/%s" % ud.branches[ud.names[0]]
 
-        cmd = "%s grep lfs %s:.gitattributes | wc -l" % (
-            ud.basecmd, refname)
-
         try:
-            output = runfetchcmd(cmd, d, quiet=True, workdir=wd)
-            if int(output) > 0:
+            ls_output = runfetchcmd(
+                "%s ls-tree -r --name-only %s" % (ud.basecmd, refname),
+                d, quiet=True, workdir=wd)
+        except bb.fetch2.FetchError:
+            return False
+
+        for path in ls_output.splitlines():
+            if not path.endswith(".gitattributes"):
+                continue
+            try:
+                blob = runfetchcmd(
+                    "%s show %s:%s" % (ud.basecmd, refname, shlex.quote(path)),
+                    d, quiet=True, workdir=wd)
+            except bb.fetch2.FetchError:
+                continue
+            if "lfs" in blob:
                 return True
-        except (bb.fetch2.FetchError,ValueError):
-            pass
         return False
 
     def _find_git_lfs(self, d):
