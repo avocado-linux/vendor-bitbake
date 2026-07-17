@@ -763,8 +763,20 @@ def mkdirhier(directory):
     try:
         os.makedirs(directory)
     except OSError as e:
-        if e.errno != errno.EEXIST or not os.path.isdir(directory):
+        if e.errno != errno.EEXIST:
             raise e
+        # EEXIST: something already occupies the path. On a shared NFS sstate
+        # cache the local negative-dentry/attribute cache can lag the server
+        # after another build node creates this shard directory, so a plain
+        # os.path.isdir() spuriously reports it absent right after the server
+        # returns EEXIST. Re-raise only when a fresh stat positively shows a
+        # non-directory; a stale "does not exist" view (FileNotFoundError) is
+        # treated as success, trusting the EEXIST the server just returned.
+        try:
+            if not stat.S_ISDIR(os.stat(directory).st_mode):
+                raise e
+        except FileNotFoundError:
+            pass
 
 def movefile(src, dest, newmtime = None, sstat = None):
     """Moves a file from src to dest, preserving all permissions and
