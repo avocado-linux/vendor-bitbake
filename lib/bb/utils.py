@@ -760,23 +760,35 @@ def mkdirhier(directory):
     """
     if '${' in str(directory):
         bb.fatal("Directory name {} contains unexpanded bitbake variable. This may cause build failures and WORKDIR polution.".format(directory))
-    try:
-        os.makedirs(directory)
-    except OSError as e:
-        if e.errno != errno.EEXIST:
-            raise e
-        # EEXIST: something already occupies the path. On a shared NFS sstate
-        # cache the local negative-dentry/attribute cache can lag the server
-        # after another build node creates this shard directory, so a plain
-        # os.path.isdir() spuriously reports it absent right after the server
-        # returns EEXIST. Re-raise only when a fresh stat positively shows a
-        # non-directory; a stale "does not exist" view (FileNotFoundError) is
-        # treated as success, trusting the EEXIST the server just returned.
+    # On a shared NFS sstate cache a second build node racing the same shard can
+    # make os.makedirs return a stale handle (ESTALE) or trip over a parent a
+    # concurrent rmdir removed mid-create (ENOENT). Both are transient, so retry
+    # a bounded number of times (letting the attribute cache settle) rather than
+    # aborting the build; a losing racer then converges instead of failing.
+    for attempt in range(5):
         try:
-            if not stat.S_ISDIR(os.stat(directory).st_mode):
-                raise e
-        except FileNotFoundError:
-            pass
+            os.makedirs(directory)
+            return
+        except OSError as e:
+            if e.errno == errno.EEXIST:
+                # EEXIST: something already occupies the path. The local
+                # negative-dentry/attribute cache can lag the server after
+                # another build node creates this shard directory, so a plain
+                # os.path.isdir() spuriously reports it absent right after the
+                # server returns EEXIST. Re-raise only when a fresh stat
+                # positively shows a non-directory; a stale "does not exist"
+                # view (FileNotFoundError) is treated as success, trusting the
+                # EEXIST the server just returned.
+                try:
+                    if not stat.S_ISDIR(os.stat(directory).st_mode):
+                        raise e
+                except FileNotFoundError:
+                    pass
+                return
+            if e.errno in (errno.ESTALE, errno.ENOENT) and attempt < 4:
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            raise e
 
 def movefile(src, dest, newmtime = None, sstat = None):
     """Moves a file from src to dest, preserving all permissions and
