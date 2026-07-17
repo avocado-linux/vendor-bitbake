@@ -61,7 +61,14 @@ class AsyncClient(object):
 
     async def connect_tcp(self, address, port):
         async def connect_sock():
-            reader, writer = await asyncio.open_connection(address, port)
+            # Bound the connect on self.timeout. asyncio.open_connection never
+            # times out on its own, so a server whose accept queue is momentarily
+            # not serviced (e.g. under concurrent multi-node load) would wedge the
+            # client forever - only reads were bounded before. wait_for(None) keeps
+            # the unbounded behaviour when no timeout is configured.
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(address, port), self.timeout
+            )
             return StreamConnection(reader, writer, self.timeout, self.max_chunk)
 
         self._connect_sock = connect_sock
@@ -75,7 +82,11 @@ class AsyncClient(object):
                 # The socket must be opened synchronously so that CWD doesn't get
                 # changed out from underneath us so we pass as a sock into asyncio
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
+                # Bound the blocking connect the same way connect_tcp/websocket
+                # bound theirs; asyncio takes the socket non-blocking below.
+                sock.settimeout(self.timeout)
                 sock.connect(os.path.basename(path))
+                sock.settimeout(None)
             finally:
                 os.chdir(cwd)
             reader, writer = await asyncio.open_unix_connection(sock=sock)
