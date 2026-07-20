@@ -85,7 +85,13 @@ class AsyncClient(object):
                 # Bound the blocking connect the same way connect_tcp/websocket
                 # bound theirs; asyncio takes the socket non-blocking below.
                 sock.settimeout(self.timeout)
-                sock.connect(os.path.basename(path))
+                try:
+                    sock.connect(os.path.basename(path))
+                except Exception:
+                    # Close the fd if the bounded connect times out or fails;
+                    # otherwise the socket leaks on every failed retry.
+                    sock.close()
+                    raise
                 sock.settimeout(None)
             finally:
                 os.chdir(cwd)

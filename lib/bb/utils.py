@@ -780,10 +780,17 @@ def mkdirhier(directory):
                 # view (FileNotFoundError) is treated as success, trusting the
                 # EEXIST the server just returned.
                 try:
-                    if not stat.S_ISDIR(os.stat(directory).st_mode):
-                        raise e
-                except FileNotFoundError:
-                    pass
+                    st = os.stat(directory)
+                except OSError as stat_err:
+                    # A stale or absent view of the path - ENOENT
+                    # (FileNotFoundError) or an ESTALE from the racing NFS
+                    # handle - means we cannot positively disprove the
+                    # directory, so trust the EEXIST the server just returned.
+                    if stat_err.errno in (errno.ENOENT, errno.ESTALE):
+                        return
+                    raise
+                if not stat.S_ISDIR(st.st_mode):
+                    raise e
                 return
             if e.errno in (errno.ESTALE, errno.ENOENT) and attempt < 4:
                 time.sleep(0.1 * (attempt + 1))
