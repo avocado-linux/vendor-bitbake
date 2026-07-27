@@ -766,6 +766,7 @@ def mkdirhier(directory):
     # a bounded number of times (letting the attribute cache settle) rather than
     # aborting the build; a losing racer then converges instead of failing.
     for attempt in range(5):
+        last_attempt = attempt == 4
         try:
             os.makedirs(directory)
             return
@@ -776,23 +777,30 @@ def mkdirhier(directory):
                 # another build node creates this shard directory, so a plain
                 # os.path.isdir() spuriously reports it absent right after the
                 # server returns EEXIST. Re-raise only when a fresh stat
-                # positively shows a non-directory; a stale "does not exist"
-                # view (FileNotFoundError) is treated as success, trusting the
-                # EEXIST the server just returned.
+                # positively shows a non-directory.
                 try:
                     st = os.stat(directory)
                 except OSError as stat_err:
-                    # A stale or absent view of the path - ENOENT
-                    # (FileNotFoundError) or an ESTALE from the racing NFS
-                    # handle - means we cannot positively disprove the
-                    # directory, so trust the EEXIST the server just returned.
                     if stat_err.errno in (errno.ENOENT, errno.ESTALE):
+                        # Two different situations land here and the stat cannot
+                        # tell them apart: a stale client-side view of a
+                        # directory the server really has, or a genuine
+                        # concurrent rmdir that removed it after the EEXIST.
+                        # Retrying resolves both - the stale view settles, or the
+                        # next makedirs re-creates the vanished directory - so
+                        # keep looping instead of returning with no directory
+                        # present and breaking the mkdir -p postcondition. Only
+                        # once the retries are spent do we fall back to trusting
+                        # the server's EEXIST.
+                        if not last_attempt:
+                            time.sleep(0.1 * (attempt + 1))
+                            continue
                         return
                     raise
                 if not stat.S_ISDIR(st.st_mode):
                     raise e
                 return
-            if e.errno in (errno.ESTALE, errno.ENOENT) and attempt < 4:
+            if e.errno in (errno.ESTALE, errno.ENOENT) and not last_attempt:
                 time.sleep(0.1 * (attempt + 1))
                 continue
             raise e
