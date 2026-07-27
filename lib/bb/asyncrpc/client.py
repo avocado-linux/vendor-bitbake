@@ -24,6 +24,17 @@ ADDR_TYPE_UNIX = 0
 ADDR_TYPE_TCP = 1
 ADDR_TYPE_WS = 2
 
+def _close_stray_connection(task):
+    """Close a connection that completed after its wait_for already timed out.
+
+    Retrieving the result (or exception) also marks it consumed, so a discarded
+    connect never surfaces as an "exception was never retrieved" warning.
+    """
+    if task.cancelled() or task.exception() is not None:
+        return
+    _reader, writer = task.result()
+    writer.close()
+
 def parse_address(addr):
     if addr.startswith(UNIX_PREFIX):
         return (ADDR_TYPE_UNIX, (addr[len(UNIX_PREFIX) :],))
@@ -64,11 +75,28 @@ class AsyncClient(object):
             # Bound the connect on self.timeout. asyncio.open_connection never
             # times out on its own, so a server whose accept queue is momentarily
             # not serviced (e.g. under concurrent multi-node load) would wedge the
-            # client forever - only reads were bounded before. wait_for(None) keeps
-            # the unbounded behaviour when no timeout is configured.
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(address, port), self.timeout
-            )
+            # client forever - only reads were bounded before. A negative timeout
+            # is StreamConnection.recv()'s "unbounded" sentinel, so pass None
+            # rather than letting wait_for expire instantly on it.
+            timeout = self.timeout if self.timeout >= 0 else None
+            # Shield the connect from wait_for's cancel: a socket that finishes
+            # its handshake just as the timeout fires is handed to the cancelled
+            # task and its fd leaks. Shielded, the task completes and the
+            # done-callback closes whatever it produced.
+            connecting = asyncio.ensure_future(asyncio.open_connection(address, port))
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.shield(connecting), timeout
+                )
+            except asyncio.TimeoutError:
+                connecting.add_done_callback(_close_stray_connection)
+                # Mirror StreamConnection.recv(): asyncio.TimeoutError is not an
+                # OSError before Python 3.11, so _send_wrapper's retry catch would
+                # miss it and a slow accept queue would fail hard instead of
+                # taking the reconnect path this timeout exists to feed.
+                raise ConnectionError(
+                    "Timed out connecting to %s:%s" % (address, port)
+                )
             return StreamConnection(reader, writer, self.timeout, self.max_chunk)
 
         self._connect_sock = connect_sock
@@ -83,8 +111,13 @@ class AsyncClient(object):
                 # changed out from underneath us so we pass as a sock into asyncio
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
                 # Bound the blocking connect the same way connect_tcp/websocket
-                # bound theirs; asyncio takes the socket non-blocking below.
-                sock.settimeout(self.timeout)
+                # bound theirs; asyncio takes the socket non-blocking below. A
+                # negative timeout is StreamConnection.recv()'s "unbounded"
+                # sentinel, and settimeout() rejects it with a ValueError that
+                # _send_wrapper does not catch - so leave the socket unbounded
+                # instead, matching what the sentinel asks for.
+                if self.timeout >= 0:
+                    sock.settimeout(self.timeout)
                 try:
                     sock.connect(os.path.basename(path))
                 except Exception:
