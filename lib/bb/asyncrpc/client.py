@@ -24,6 +24,14 @@ ADDR_TYPE_UNIX = 0
 ADDR_TYPE_TCP = 1
 ADDR_TYPE_WS = 2
 
+# Retries after a failed request, once a connection is established.
+MAX_REQUEST_RETRIES = 3
+# Retries after a failed connect. Lower than the request budget on purpose: a
+# peer that is wedged rather than down costs a full timeout per attempt, since
+# the SYN is neither answered nor refused, so each retry here is worth up to
+# self.timeout of wall clock rather than a round trip.
+MAX_CONNECT_RETRIES = 1
+
 def _close_stray_connection(task):
     """Close a connection nobody is left to take: a connect that outlived the
     wait_for which timed out on it, or one orphaned when the caller was
@@ -202,10 +210,22 @@ class AsyncClient(object):
         await self.disconnect()
 
     async def _send_wrapper(self, proc):
+        # Connect failures and request failures are retried on separate budgets.
+        #
+        # They fail on very different timescales. A request retry costs whatever
+        # the server takes to answer; a connect retry against a peer that is
+        # wedged rather than down costs a full self.timeout each, because the
+        # SYN is neither answered nor refused. Sharing one budget meant a
+        # blackholed peer spent four connect timeouts back to back - 120s at the
+        # default - before the caller heard anything. A down server is not
+        # affected either way: ECONNREFUSED returns in microseconds.
+        connect_count = 0
         count = 0
         while True:
+            connecting = True
             try:
                 await self.connect()
+                connecting = False
                 return await proc()
             except (
                 OSError,
@@ -215,12 +235,19 @@ class AsyncClient(object):
                 UnicodeDecodeError,
             ) as e:
                 self.logger.warning("Error talking to server: %s" % e)
-                if count >= 3:
+                if connecting:
+                    spent, limit = connect_count, MAX_CONNECT_RETRIES
+                else:
+                    spent, limit = count, MAX_REQUEST_RETRIES
+                if spent >= limit:
                     if not isinstance(e, ConnectionError):
                         raise ConnectionError(str(e))
                     raise e
                 await self.close()
-                count += 1
+                if connecting:
+                    connect_count += 1
+                else:
+                    count += 1
 
     def check_invoke_error(self, msg):
         if isinstance(msg, dict) and "invoke-error" in msg:
