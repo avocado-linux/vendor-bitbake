@@ -25,7 +25,9 @@ ADDR_TYPE_TCP = 1
 ADDR_TYPE_WS = 2
 
 def _close_stray_connection(task):
-    """Close a connection that completed after its wait_for already timed out.
+    """Close a connection nobody is left to take: a connect that outlived the
+    wait_for which timed out on it, or one orphaned when the caller was
+    cancelled mid-handshake.
 
     Retrieving the result (or exception) also marks it consumed, so a discarded
     connect never surfaces as an "exception was never retrieved" warning.
@@ -84,12 +86,12 @@ class AsyncClient(object):
             # task and its fd leaks. Shielded, the task completes and the
             # done-callback closes whatever it produced.
             connecting = asyncio.ensure_future(asyncio.open_connection(address, port))
+            connected = None
             try:
-                reader, writer = await asyncio.wait_for(
+                connected = await asyncio.wait_for(
                     asyncio.shield(connecting), timeout
                 )
             except asyncio.TimeoutError:
-                connecting.add_done_callback(_close_stray_connection)
                 # Mirror StreamConnection.recv(): asyncio.TimeoutError is not an
                 # OSError before Python 3.11, so _send_wrapper's retry catch would
                 # miss it and a slow accept queue would fail hard instead of
@@ -97,6 +99,20 @@ class AsyncClient(object):
                 raise ConnectionError(
                     "Timed out connecting to %s:%s" % (address, port)
                 )
+            finally:
+                # Whenever we did NOT take the result, the shielded connect is
+                # still running with nobody left to consume it - shield's own
+                # done-callback drops the inner one as it unwinds. That covers
+                # the timeout above and, importantly, cancellation of the
+                # enclosing task: CancelledError is a BaseException, so an
+                # except-clause here would never see it, and a long-lived caller
+                # cancelled mid-handshake (hashserv's backfill worker at
+                # shutdown, say) would orphan the socket exactly when the accept
+                # queue is wedged. Attaching in `finally` catches every exit that
+                # is not a successful hand-off.
+                if connected is None:
+                    connecting.add_done_callback(_close_stray_connection)
+            reader, writer = connected
             return StreamConnection(reader, writer, self.timeout, self.max_chunk)
 
         self._connect_sock = connect_sock
