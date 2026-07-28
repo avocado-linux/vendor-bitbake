@@ -765,8 +765,16 @@ def mkdirhier(directory):
     # concurrent rmdir removed mid-create (ENOENT). Both are transient, so retry
     # a bounded number of times (letting the attribute cache settle) rather than
     # aborting the build; a losing racer then converges instead of failing.
-    for attempt in range(5):
-        last_attempt = attempt == 4
+    #
+    # One constant, not two literals that have to agree: with a separate
+    # `attempt == 4` the pair can drift, and shrinking the bound below it makes
+    # `last_attempt` unreachable, so every iteration continues, control falls off
+    # the loop, and mkdirhier returns None having created nothing and raised
+    # nothing - a silent breach of the mkdir -p postcondition this retry exists
+    # to protect.
+    MKDIRHIER_ATTEMPTS = 5
+    for attempt in range(MKDIRHIER_ATTEMPTS):
+        last_attempt = attempt == MKDIRHIER_ATTEMPTS - 1
         try:
             os.makedirs(directory)
             return
