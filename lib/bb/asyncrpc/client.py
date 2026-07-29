@@ -222,10 +222,8 @@ class AsyncClient(object):
         connect_count = 0
         count = 0
         while True:
-            connecting = True
             try:
                 await self.connect()
-                connecting = False
                 return await proc()
             except (
                 OSError,
@@ -235,6 +233,15 @@ class AsyncClient(object):
                 UnicodeDecodeError,
             ) as e:
                 self.logger.warning("Error talking to server: %s" % e)
+                # self.socket is set the instant _connect_sock() hands one back,
+                # and cleared by close() below, so it is exactly the "did we get
+                # a socket at all" discriminator - no separate flag to keep in
+                # step with connect()'s two phases. Anything that fails with a
+                # socket already in hand cost a round trip rather than a connect
+                # timeout: the header exchange in setup_connection(), hashserv's
+                # auth() on top of it, or the request itself. Those bill the
+                # request budget.
+                connecting = self.socket is None
                 if connecting:
                     spent, limit = connect_count, MAX_CONNECT_RETRIES
                 else:
