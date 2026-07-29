@@ -161,11 +161,23 @@ class AsyncClient(object):
         import websockets
 
         async def connect_sock():
-            websocket = await websockets.connect(
-                uri,
-                ping_interval=None,
-                open_timeout=self.timeout,
-            )
+            # A negative timeout is StreamConnection.recv()'s "unbounded"
+            # sentinel; websockets spells that None. Passing the negative value
+            # straight through inverts the sentinel into "time out at once".
+            open_timeout = self.timeout if self.timeout >= 0 else None
+            try:
+                websocket = await websockets.connect(
+                    uri,
+                    ping_interval=None,
+                    open_timeout=open_timeout,
+                )
+            except asyncio.TimeoutError:
+                # Same conversion connect_tcp does, and for the same reason:
+                # before Python 3.11 asyncio.TimeoutError is not an OSError, so
+                # _send_wrapper's retry catch would miss the open_timeout that
+                # websockets raises here and a stalled accept queue would fail
+                # hard instead of taking the reconnect path.
+                raise ConnectionError("Timed out connecting to %s" % uri)
             return WebsocketConnection(websocket, self.timeout)
 
         self._connect_sock = connect_sock

@@ -8,7 +8,10 @@
 
 import asyncio
 import logging
+import sys
+import types
 import unittest
+from unittest import mock
 
 from bb.asyncrpc.client import (
     MAX_CONNECT_RETRIES,
@@ -105,3 +108,41 @@ class RetryBudgets(unittest.TestCase):
         self.assertEqual(client.sock_attempts, 1)
         self.assertEqual(client.handshake_attempts, 1)
         self.assertEqual(client.proc_attempts, 1)
+
+
+class WebsocketConnect(unittest.TestCase):
+    def test_open_timeout_is_converted_to_connection_error(self):
+        async def fake_connect(uri, **kwargs):
+            # What websockets raises when open_timeout expires. Before Python
+            # 3.11 this is asyncio.TimeoutError, which is not an OSError, so it
+            # escapes _send_wrapper's retry catch entirely.
+            raise asyncio.TimeoutError("timed out during opening handshake")
+
+        client = AsyncClient("test", "1.0", logger, timeout=1)
+        fake = types.ModuleType("websockets")
+        fake.connect = fake_connect
+
+        with mock.patch.dict(sys.modules, {"websockets": fake}):
+            asyncio.run(client.connect_websocket("ws://example.invalid:1234"))
+            with self.assertRaises(ConnectionError):
+                asyncio.run(client._connect_sock())
+
+    def test_negative_timeout_leaves_the_open_unbounded(self):
+        seen = {}
+
+        async def fake_connect(uri, **kwargs):
+            seen.update(kwargs)
+            return object()
+
+        client = AsyncClient("test", "1.0", logger, timeout=-1)
+        fake = types.ModuleType("websockets")
+        fake.connect = fake_connect
+
+        with mock.patch.dict(sys.modules, {"websockets": fake}):
+            asyncio.run(client.connect_websocket("ws://example.invalid:1234"))
+            asyncio.run(client._connect_sock())
+
+        # A negative timeout is the "unbounded" sentinel the connection classes
+        # honour; websockets spells that None. Passing the negative value
+        # through would invert it into "time out immediately".
+        self.assertIsNone(seen["open_timeout"])
