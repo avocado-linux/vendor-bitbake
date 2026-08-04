@@ -774,30 +774,46 @@ def mkdirhier(directory):
             return
         except OSError as e:
             if e.errno == errno.EEXIST:
-                # EEXIST: something already occupies the path. The local
-                # negative-dentry/attribute cache can lag the server after
-                # another build node creates this shard directory, so a plain
-                # os.path.isdir() spuriously reports it absent right after the
-                # server returns EEXIST. Re-raise only when a fresh stat
-                # positively shows a non-directory.
+                # EEXIST: something already occupies the path. os.stat() is used
+                # rather than os.path.isdir() because isdir() collapses every
+                # OSError into False, so it cannot distinguish "the path is not a
+                # directory" from "the stat itself failed with ESTALE" - and on a
+                # shared cache those need opposite handling. (isdir() is itself
+                # os.stat() plus S_ISDIR, so this buys error visibility, not a
+                # fresher view of the filesystem.)
                 try:
                     st = os.stat(directory)
                 except OSError as stat_err:
                     if stat_err.errno in (errno.ENOENT, errno.ESTALE):
-                        # Two different situations land here and the stat cannot
-                        # tell them apart: a stale client-side view of a
-                        # directory the server really has, or a genuine
-                        # concurrent rmdir that removed it after the EEXIST.
-                        # Retrying resolves both - the stale view settles, or the
-                        # next makedirs re-creates the vanished directory - so
-                        # keep looping instead of returning with no directory
-                        # present and breaking the mkdir -p postcondition. Only
-                        # once the retries are spent do we fall back to trusting
-                        # the server's EEXIST.
+                        # The server said something is here, but stat cannot
+                        # resolve it. Two causes needing opposite responses:
+                        #
+                        #  - A symlink whose target is missing. mkdir(2) returns
+                        #    EEXIST for a symlink regardless of its target, and
+                        #    stat() follows the link and fails. Permanent, and
+                        #    reachable with no NFS at all, so retrying only delays
+                        #    the failure. os.lstat() does not follow the link, so
+                        #    it still succeeds - that is what separates the cases.
+                        #  - A stale client view of a directory the server has, or
+                        #    a concurrent rmdir that removed it after the EEXIST.
+                        #    Nothing is at the path, so lstat fails too, and
+                        #    retrying lets the view settle or the next makedirs
+                        #    re-create it.
+                        try:
+                            os.lstat(directory)
+                        except OSError:
+                            pass
+                        else:
+                            raise e
                         if not last_attempt:
                             time.sleep(0.1 * (attempt + 1))
                             continue
-                        return
+                        # Retries spent with still nothing at the path. Raise
+                        # rather than return: mkdirhier must never report success
+                        # without a directory present, which is the postcondition
+                        # every caller relies on. Upstream raises here too (its
+                        # isdir() check is False in this state).
+                        raise e
                     raise
                 if not stat.S_ISDIR(st.st_mode):
                     raise e

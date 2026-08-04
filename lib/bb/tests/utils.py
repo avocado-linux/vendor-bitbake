@@ -684,3 +684,54 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIn("A", os.environ)
         self.assertEqual(os.environ["A"], "this is A")
         self.assertNotIn("B", os.environ)
+
+
+class MkdirHier(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix='bitbake-mkdirhier-')
+        self.addCleanup(bb.utils.prunedir, self.tmpdir)
+
+    def test_creates_missing_tree(self):
+        target = os.path.join(self.tmpdir, 'a', 'b', 'c')
+        bb.utils.mkdirhier(target)
+        self.assertTrue(os.path.isdir(target))
+
+    def test_existing_directory_is_not_an_error(self):
+        target = os.path.join(self.tmpdir, 'already')
+        os.mkdir(target)
+        bb.utils.mkdirhier(target)
+        self.assertTrue(os.path.isdir(target))
+
+    def test_existing_file_raises(self):
+        target = os.path.join(self.tmpdir, 'a-file')
+        with open(target, 'w'):
+            pass
+        with self.assertRaises(OSError):
+            bb.utils.mkdirhier(target)
+        self.assertFalse(os.path.isdir(target))
+
+    def test_dangling_symlink_raises_rather_than_reporting_success(self):
+        # mkdir(2) returns EEXIST for a symlink whether or not its target
+        # exists, and os.stat() follows the link and fails with ENOENT. Reporting
+        # success here would break the mkdir -p postcondition every caller
+        # relies on, with no NFS involved at all.
+        target = os.path.join(self.tmpdir, 'dangling')
+        os.symlink(os.path.join(self.tmpdir, 'no-such-target'), target)
+        with self.assertRaises(OSError):
+            bb.utils.mkdirhier(target)
+        self.assertFalse(os.path.isdir(target))
+
+    def test_symlink_to_directory_is_accepted(self):
+        # A symlink that does resolve to a directory satisfies the
+        # postcondition, so it must not be swept up by the dangling-link check.
+        real = os.path.join(self.tmpdir, 'real')
+        os.mkdir(real)
+        link = os.path.join(self.tmpdir, 'link')
+        os.symlink(real, link)
+        bb.utils.mkdirhier(link)
+        self.assertTrue(os.path.isdir(link))
+
+    def test_unexpanded_variable_is_fatal(self):
+        # bb.fatal() raises BBHandledException, not SystemExit.
+        with self.assertRaises(bb.BBHandledException):
+            bb.utils.mkdirhier(os.path.join(self.tmpdir, '${FOO}', 'x'))
