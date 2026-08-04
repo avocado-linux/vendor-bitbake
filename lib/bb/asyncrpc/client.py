@@ -11,6 +11,7 @@ import os
 import socket
 import sys
 import re
+import time
 import contextlib
 from threading import Thread
 from .connection import StreamConnection, WebsocketConnection, DEFAULT_MAX_CHUNK
@@ -26,24 +27,23 @@ ADDR_TYPE_WS = 2
 
 # Retries after a failed request, once a connection is established.
 MAX_REQUEST_RETRIES = 3
-# Retries after a failed connect. Lower than the request budget on purpose: a
-# peer that is wedged rather than down costs a full timeout per attempt, since
-# the SYN is neither answered nor refused, so each retry here is worth up to
-# self.timeout of wall clock rather than a round trip.
-MAX_CONNECT_RETRIES = 1
-
-def _close_stray_connection(task):
-    """Close a connection nobody is left to take: a connect that outlived the
-    wait_for which timed out on it, or one orphaned when the caller was
-    cancelled mid-handshake.
-
-    Retrieving the result (or exception) also marks it consumed, so a discarded
-    connect never surfaces as an "exception was never retrieved" warning.
-    """
-    if task.cancelled() or task.exception() is not None:
-        return
-    _reader, writer = task.result()
-    writer.close()
+# Retries after a failed connect. Upstream's `count >= 3` allowed 4 attempts and
+# this keeps that, because the wall clock is bounded by RETRY_DEADLINE below
+# rather than by the attempt count - capping attempts was the wrong lever, since
+# it also halved tolerance for the cheap ECONNREFUSED case.
+MAX_CONNECT_RETRIES = 3
+# Sleep between connect retries. Without one, every attempt is spent inside the
+# few hundred ms a restarting hashserv/prserv spends rebinding, because
+# ECONNREFUSED returns in microseconds - so the retries all land in the same
+# refusal window and buy nothing.
+CONNECT_RETRY_BACKOFF = 0.2
+# Ceiling on the wall clock one call may spend across ALL its retries, as a
+# multiple of self.timeout. This, not the attempt counts, is what bounds a wedged
+# peer: splitting the budgets did not help the common wedge shape, because the
+# kernel completes the TCP handshake for a process that is listening but blocked,
+# so the client gets a socket and the failure bills the REQUEST budget - four
+# attempts of self.timeout each, 120s at the default.
+RETRY_DEADLINE_TIMEOUTS = 2
 
 def parse_address(addr):
     if addr.startswith(UNIX_PREFIX):
@@ -89,15 +89,18 @@ class AsyncClient(object):
             # is StreamConnection.recv()'s "unbounded" sentinel, so pass None
             # rather than letting wait_for expire instantly on it.
             timeout = self.timeout if self.timeout >= 0 else None
-            # Shield the connect from wait_for's cancel: a socket that finishes
-            # its handshake just as the timeout fires is handed to the cancelled
-            # task and its fd leaks. Shielded, the task completes and the
-            # done-callback closes whatever it produced.
-            connecting = asyncio.ensure_future(asyncio.open_connection(address, port))
-            connected = None
+            # No shield here. A cancelled open_connection() does not orphan its
+            # socket: BaseEventLoop._connect_sock and
+            # _create_connection_transport both close what they made from a bare
+            # `except:`, which catches CancelledError, and streams.open_connection
+            # has no await between create_connection returning and returning the
+            # (reader, writer) pair - so there is no point at which cancellation
+            # can be delivered to a connection nobody will close. Verified on
+            # 3.14 plus 300 cancelled connects: fd count flat, no
+            # ResourceWarnings.
             try:
-                connected = await asyncio.wait_for(
-                    asyncio.shield(connecting), timeout
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(address, port), timeout
                 )
             except asyncio.TimeoutError:
                 # Mirror StreamConnection.recv(): asyncio.TimeoutError is not an
@@ -107,20 +110,6 @@ class AsyncClient(object):
                 raise ConnectionError(
                     "Timed out connecting to %s:%s" % (address, port)
                 )
-            finally:
-                # Whenever we did NOT take the result, the shielded connect is
-                # still running with nobody left to consume it - shield's own
-                # done-callback drops the inner one as it unwinds. That covers
-                # the timeout above and, importantly, cancellation of the
-                # enclosing task: CancelledError is a BaseException, so an
-                # except-clause here would never see it, and a long-lived caller
-                # cancelled mid-handshake (hashserv's backfill worker at
-                # shutdown, say) would orphan the socket exactly when the accept
-                # queue is wedged. Attaching in `finally` catches every exit that
-                # is not a successful hand-off.
-                if connected is None:
-                    connecting.add_done_callback(_close_stray_connection)
-            reader, writer = connected
             return StreamConnection(reader, writer, self.timeout, self.max_chunk)
 
         self._connect_sock = connect_sock
@@ -222,15 +211,21 @@ class AsyncClient(object):
         await self.disconnect()
 
     async def _send_wrapper(self, proc):
-        # Connect failures and request failures are retried on separate budgets.
+        # Connect failures and request failures are retried on separate budgets,
+        # because they fail on different timescales: a request retry normally
+        # costs a round trip, while a connect against a blackholed peer costs a
+        # full self.timeout because the SYN is neither answered nor refused.
         #
-        # They fail on very different timescales. A request retry costs whatever
-        # the server takes to answer; a connect retry against a peer that is
-        # wedged rather than down costs a full self.timeout each, because the
-        # SYN is neither answered nor refused. Sharing one budget meant a
-        # blackholed peer spent four connect timeouts back to back - 120s at the
-        # default - before the caller heard anything. A down server is not
-        # affected either way: ECONNREFUSED returns in microseconds.
+        # The attempt counts alone do NOT bound a wedged peer, though. The more
+        # likely wedge is a process that is alive and listening but blocked (NFS
+        # I/O, an sqlite lock, GIL starvation): the kernel completes the
+        # handshake on its behalf, so the client gets a socket, self.socket is
+        # non-None, and every subsequent timeout bills the REQUEST budget at
+        # self.timeout apiece. The deadline below is what actually caps that, and
+        # it applies to whichever budget the failure lands on.
+        deadline = None
+        if self.timeout and self.timeout > 0:
+            deadline = time.monotonic() + self.timeout * RETRY_DEADLINE_TIMEOUTS
         connect_count = 0
         count = 0
         while True:
@@ -258,13 +253,19 @@ class AsyncClient(object):
                     spent, limit = connect_count, MAX_CONNECT_RETRIES
                 else:
                     spent, limit = count, MAX_REQUEST_RETRIES
-                if spent >= limit:
+                out_of_time = deadline is not None and time.monotonic() >= deadline
+                if spent >= limit or out_of_time:
                     if not isinstance(e, ConnectionError):
                         raise ConnectionError(str(e))
                     raise e
                 await self.close()
                 if connecting:
                     connect_count += 1
+                    # Space the connect retries out. See CONNECT_RETRY_BACKOFF:
+                    # against ECONNREFUSED all the attempts otherwise complete
+                    # inside the same rebind window and none of them outlast it.
+                    if CONNECT_RETRY_BACKOFF > 0:
+                        await asyncio.sleep(CONNECT_RETRY_BACKOFF)
                 else:
                     count += 1
 
