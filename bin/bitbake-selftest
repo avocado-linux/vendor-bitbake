@@ -20,7 +20,8 @@ try:
 except RuntimeError as exc:
     sys.exit(str(exc))
 
-tests = ["bb.tests.codeparser",
+tests = ["bb.tests.cgroup",
+         "bb.tests.codeparser",
          "bb.tests.color",
          "bb.tests.cooker",
          "bb.tests.cow",

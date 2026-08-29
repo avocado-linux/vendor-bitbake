@@ -542,6 +542,32 @@ overview of their function and contents.
       If you want to force log files to take a specific name, you can set this
       variable in a configuration file.
 
+   :term:`BB_MAX_MEMORY_USAGE`
+      Specifies the percentage of the memory cgroup limit above which
+      BitBake's scheduler will not start new tasks (providing there is at
+      least one active task). If no value is set, or no finite memory limit
+      applies to the build, memory usage is not monitored when starting
+      tasks.
+
+      This complements :term:`BB_PRESSURE_MAX_MEMORY` for builds confined by
+      a cgroup v2 memory limit, such as a container or a systemd slice.
+      Anonymous memory from compilers cannot be reclaimed and such a build
+      typically has no swap, so it reports little or no memory pressure
+      right up to the point where the kernel OOM-kills it. Gating new tasks
+      on the cgroup's usage instead lets the running tasks finish and the
+      usage fall back, at the cost of a slower build while several
+      memory-hungry compiles coincide.
+
+      The limit is read from the nearest ``memory.max`` in the process's
+      cgroup ancestry and the usage from the matching ``memory.current``.
+      A value in ``conf/local.conf`` could be::
+
+         BB_MAX_MEMORY_USAGE = "75"
+
+      Leave headroom for the tasks already running when the gate closes:
+      with N parallel tasks, roughly N times the largest single compiler
+      footprint should fit between the threshold and the limit.
+
    :term:`BB_MULTI_PROVIDER_ALLOWED`
       Allows you to suppress BitBake warnings caused when building two
       separate recipes that provide the same output.
@@ -684,7 +710,10 @@ overview of their function and contents.
       monitored when starting tasks.
 
       The pressure data is calculated based upon what Linux kernels since
-      version 4.20 expose under ``/proc/pressure``. The threshold represents
+      version 4.20 expose under ``/proc/pressure``, or the build's own
+      cgroup ``memory.pressure`` when it runs under a cgroup v2 hierarchy,
+      so a containerised build regulates on its own stalls rather than the
+      whole host's. The threshold represents
       the difference in "total" pressure from the previous second. The
       minimum value is 1.0 (extremely slow builds) and the maximum is
       1000000 (a pressure value unlikely to ever be reached). See

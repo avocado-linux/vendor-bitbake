@@ -34,6 +34,56 @@ logger = logging.getLogger("BitBake.RunQueue")
 hashequiv_logger = logging.getLogger("BitBake.RunQueue.HashEquiv")
 psi_logger = logging.getLogger("BitBake.RunQueue.PSI")
 
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+def cgroup_dir():
+    """
+    Return the cgroup v2 directory this process belongs to, or None when the
+    host is not on a unified hierarchy.
+    """
+    try:
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                hier, _, path = line.strip().partition("::")
+                if hier == "0":
+                    return os.path.normpath(CGROUP_ROOT + path)
+    except OSError:
+        pass
+    return None
+
+def pressure_files():
+    """
+    Paths of the cpu/io/memory PSI files to regulate against. A cgroup's own
+    pressure files are preferred over /proc/pressure/* so a build confined by
+    a cgroup (a container, a systemd slice) sees its own stalls rather than
+    the whole host's.
+    """
+    d = cgroup_dir()
+    if d and all(os.access(os.path.join(d, r + ".pressure"), os.R_OK) for r in ("cpu", "io", "memory")):
+        return tuple(os.path.join(d, r + ".pressure") for r in ("cpu", "io", "memory"))
+    return ("/proc/pressure/cpu", "/proc/pressure/io", "/proc/pressure/memory")
+
+def cgroup_memory_limit(start=None, root=CGROUP_ROOT):
+    """
+    Walk from the process cgroup up to the hierarchy root and return
+    (memory.current path, limit in bytes) for the nearest ancestor with a
+    finite memory.max, or None when nothing bounds this process.
+    """
+    d = start if start is not None else cgroup_dir()
+    root = os.path.normpath(root)
+    while d and d.startswith(root):
+        try:
+            with open(os.path.join(d, "memory.max")) as f:
+                value = f.read().strip()
+            if value != "max":
+                return (os.path.join(d, "memory.current"), int(value))
+        except (OSError, ValueError):
+            pass
+        if d == root:
+            break
+        d = os.path.dirname(d)
+    return None
+
 __find_sha256__ = re.compile( r'(?i)(?<![a-z0-9])[a-f0-9]{64}(?![a-z0-9])' )
 
 def fn_from_tid(tid):
@@ -167,6 +217,7 @@ class RunQueueScheduler(object):
 
         self.rev_prio_map = None
         self.is_pressure_usable()
+        self.is_memory_usage_usable()
 
     def is_pressure_usable(self):
         """
@@ -176,9 +227,10 @@ class RunQueueScheduler(object):
         """
         if self.rq.max_cpu_pressure or self.rq.max_io_pressure or self.rq.max_memory_pressure:
             try:
-                with open("/proc/pressure/cpu") as cpu_pressure_fds, \
-                    open("/proc/pressure/io") as io_pressure_fds, \
-                    open("/proc/pressure/memory") as memory_pressure_fds:
+                self.pressure_files = pressure_files()
+                with open(self.pressure_files[0]) as cpu_pressure_fds, \
+                    open(self.pressure_files[1]) as io_pressure_fds, \
+                    open(self.pressure_files[2]) as memory_pressure_fds:
 
                     self.prev_cpu_pressure = cpu_pressure_fds.readline().split()[4].split("=")[1]
                     self.prev_io_pressure = io_pressure_fds.readline().split()[4].split("=")[1]
@@ -186,7 +238,7 @@ class RunQueueScheduler(object):
                     self.prev_pressure_time = time.time()
                 self.check_pressure = True
             except:
-                bb.note("The /proc/pressure files can't be read. Continuing build without monitoring pressure")
+                bb.note("The pressure files %s can't be read. Continuing build without monitoring pressure" % (pressure_files(),))
                 self.check_pressure = False
         else:
             self.check_pressure = False
@@ -197,10 +249,10 @@ class RunQueueScheduler(object):
         BB_PRESSURE_MAX_{CPU|IO|MEMORY} are set, return True if above threshold.
         """
         if self.check_pressure:
-            with open("/proc/pressure/cpu") as cpu_pressure_fds, \
-                open("/proc/pressure/io") as io_pressure_fds, \
-                open("/proc/pressure/memory") as memory_pressure_fds:
-                # extract "total" from /proc/pressure/{cpu|io}
+            with open(self.pressure_files[0]) as cpu_pressure_fds, \
+                open(self.pressure_files[1]) as io_pressure_fds, \
+                open(self.pressure_files[2]) as memory_pressure_fds:
+                # extract "total" from the {cpu|io|memory}.pressure files
                 curr_cpu_pressure = cpu_pressure_fds.readline().split()[4].split("=")[1]
                 curr_io_pressure = io_pressure_fds.readline().split()[4].split("=")[1]
                 curr_memory_pressure = memory_pressure_fds.readline().split()[4].split("=")[1]
@@ -239,6 +291,44 @@ class RunQueueScheduler(object):
             return limit
         return False
 
+    def is_memory_usage_usable(self):
+        """
+        If BB_MAX_MEMORY_USAGE is set, locate the memory cgroup limit this build
+        runs under. Without a finite limit there is nothing to regulate against.
+        """
+        self.check_memory_usage = False
+        # Start from "not limiting" so the first evaluation that limits is logged
+        # too: under a low threshold the gate can be closed from the first task.
+        self.memory_usage_limit = False
+        if self.rq.max_memory_usage:
+            limit = cgroup_memory_limit()
+            if limit:
+                self.memory_current_file, self.memory_limit = limit
+                self.check_memory_usage = True
+            else:
+                bb.note("No memory cgroup limit applies to this build. Continuing without monitoring memory usage")
+
+    def exceeds_max_memory_usage(self):
+        """
+        If BB_MAX_MEMORY_USAGE is set, return True while the memory cgroup this
+        build runs in is using more than that percentage of its limit.
+        """
+        if not self.check_memory_usage:
+            return False
+        try:
+            with open(self.memory_current_file) as f:
+                current = int(f.read().strip())
+        except (OSError, ValueError):
+            return False
+        usage = current * 100.0 / self.memory_limit
+        limit = usage > self.rq.max_memory_usage
+        if limit != self.memory_usage_limit:
+            # A NOTE, not verbose: this is the event an operator looks for when a
+            # build that used to OOM now merely slows down.
+            bb.note("Memory usage limiting set to %s as cgroup usage: %.1f%% of %d MiB (max %s%%) - using %s/%s bitbake threads" % (limit, usage, self.memory_limit // (1024 * 1024), self.rq.max_memory_usage, len(self.rq.runq_running.difference(self.rq.runq_complete)), self.rq.number_tasks))
+        self.memory_usage_limit = limit
+        return limit
+
     def next_buildable_task(self):
         """
         Return the id of the first task we find that is buildable
@@ -254,7 +344,7 @@ class RunQueueScheduler(object):
         # Bitbake requires that at least one task be active. Only check for pressure if
         # this is the case, otherwise the pressure limitation could result in no tasks
         # being active and no new tasks started thereby, at times, breaking the scheduler.
-        if self.rq.stats.active and self.exceeds_max_pressure():
+        if self.rq.stats.active and (self.exceeds_max_pressure() or self.exceeds_max_memory_usage()):
             return None
 
         # Filter out tasks that have a max number of threads that have been exceeded
@@ -1869,6 +1959,7 @@ class RunQueueExecute:
         self.max_io_pressure = self.cfgData.getVar("BB_PRESSURE_MAX_IO")
         self.max_memory_pressure = self.cfgData.getVar("BB_PRESSURE_MAX_MEMORY")
         self.max_loadfactor = self.cfgData.getVar("BB_LOADFACTOR_MAX")
+        self.max_memory_usage = self.cfgData.getVar("BB_MAX_MEMORY_USAGE")
 
         self.sq_buildable = set()
         self.sq_running = set()
@@ -1922,6 +2013,11 @@ class RunQueueExecute:
                 bb.fatal("Invalid BB_PRESSURE_MAX_MEMORY %s, minimum value is %s." % (self.max_memory_pressure, lower_limit))
             if self.max_memory_pressure > upper_limit:
                 bb.warn("Your build will be largely unregulated since BB_PRESSURE_MAX_MEMORY is set to %s. It is very unlikely that such high pressure will be experienced." % (self.max_io_pressure))
+
+        if self.max_memory_usage:
+            self.max_memory_usage = float(self.max_memory_usage)
+            if not 1.0 <= self.max_memory_usage <= 100.0:
+                bb.fatal("Invalid BB_MAX_MEMORY_USAGE %s, expected a percentage between 1 and 100." % (self.max_memory_usage))
 
         if self.max_loadfactor:
             self.max_loadfactor = float(self.max_loadfactor)
